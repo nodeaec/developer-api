@@ -1,0 +1,155 @@
+name: Release to Node.aec
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+env:
+  PRODUCT_SLUG: 'smart-clash-detector'
+  NODE_AEC_API_URL: 'https://api.nodeaec.com.br'
+
+jobs:
+  build-and-publish:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout Source Code
+        uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Build Plugin Solution
+        run: |
+          dotnet restore
+          dotnet build --configuration Release --no-restore
+
+      - name: Package Release ZIP
+        id: package
+        shell: pwsh
+        run: |
+          # Strip 'v' from tag (e.g. v1.2.0 -> 1.2.0)
+          $tag = "${{ github.ref_name }}"
+          $version = $tag -replace '^v',''
+          Write-Host "Releasing version: $version"
+          echo "VERSION=$version" >> $env:GITHUB_ENV
+
+          $distDir = "dist"
+          New-Item -ItemType Directory -Force -Path $distDir
+          $zipPath = "$distDir/SmartClashDetector-$version.zip"
+          Compress-Archive -Path "bin/Release/*" -DestinationPath $zipPath -Force
+          echo "ZIP_PATH=$zipPath" >> $env:GITHUB_ENV
+          echo "ZIP_NAME=SmartClashDetector-$version.zip" >> $env:GITHUB_ENV
+
+      - name: Create Version Draft on Node.aec
+        id: create_version
+        shell: bash
+        env:
+          TOKEN: ${{ secrets.NODE_AEC_API_TOKEN }}
+        run: |
+          set -euo pipefail
+          echo "Creating draft version $VERSION for $PRODUCT_SLUG..."
+          
+          RESPONSE=$(curl -s -w "\nHTTP_STATUS:%{http_code}" -X POST \
+            "$NODE_AEC_API_URL/developer/products/$PRODUCT_SLUG/versions" \
+            -H "Authorization: Bearer $TOKEN" \
+            -H "Content-Type: application/json" \
+            -d "{
+              \"version\": \"$VERSION\",
+              \"description\": \"Automated release from GitHub Actions run #${{ github.run_number }}\",
+              \"allowDownload\": true
+            }")
+
+          HTTP_STATUS=$(echo "$RESPONSE" | grep "HTTP_STATUS:" | cut -d':' -f2)
+          BODY=$(echo "$RESPONSE" | sed '/HTTP_STATUS:/d')
+
+          if [ "$HTTP_STATUS" -ne 201 ]; then
+            echo "Failed to create draft version. Status: $HTTP_STATUS"
+            echo "$BODY"
+            exit 1
+          fi
+
+          echo "Draft version created successfully."
+
+      - name: Upload Binary Release File
+        id: upload_file
+        shell: bash
+        env:
+          TOKEN: ${{ secrets.NODE_AEC_API_TOKEN }}
+        run: |
+          set -euo pipefail
+          echo "Uploading $ZIP_PATH to $PRODUCT_SLUG version $VERSION..."
+
+          UPLOAD_RESP=$(curl -s -w "\nHTTP_STATUS:%{http_code}" -X POST \
+            "$NODE_AEC_API_URL/developer/products/$PRODUCT_SLUG/versions/$VERSION/files/upload" \
+            -H "Authorization: Bearer $TOKEN" \
+            -F "file=@$ZIP_PATH" \
+            -F "name=$ZIP_NAME" \
+            -F "description=Built from Git commit ${{ github.sha }}")
+
+          UPLOAD_STATUS=$(echo "$UPLOAD_RESP" | grep "HTTP_STATUS:" | cut -d':' -f2)
+          UPLOAD_BODY=$(echo "$UPLOAD_RESP" | sed '/HTTP_STATUS:/d')
+
+          if [ "$UPLOAD_STATUS" -ne 201 ]; then
+            echo "Failed to upload release file. Status: $UPLOAD_STATUS"
+            echo "$UPLOAD_BODY"
+            exit 1
+          fi
+
+          echo "Release file uploaded successfully."
+
+      - name: Submit for Curation Review
+        shell: bash
+        env:
+          TOKEN: ${{ secrets.NODE_AEC_API_TOKEN }}
+        run: |
+          set -euo pipefail
+          echo "Submitting version $VERSION for curation review..."
+
+          SUBMIT_RESP=$(curl -s -w "\nHTTP_STATUS:%{http_code}" -X POST \
+            "$NODE_AEC_API_URL/developer/products/$PRODUCT_SLUG/versions/$VERSION/submissions" \
+            -H "Authorization: Bearer $TOKEN" \
+            -H "Content-Type: application/json" \
+            -d '{
+              "securityManifest": {
+                "network": {
+                  "hasAccess": false,
+                  "purpose": "",
+                  "domains": []
+                },
+                "filesystem": {
+                  "hasAccess": true,
+                  "scope": "Reads active BIM project models and exports clash matrix tables."
+                },
+                "processes": {
+                  "hasAccess": false,
+                  "justification": ""
+                },
+                "nativeCalls": {
+                  "hasAccess": false,
+                  "libraries": []
+                },
+                "registry": {
+                  "hasAccess": false,
+                  "keys": []
+                },
+                "telemetry": {
+                  "hasAccess": false,
+                  "fields": [],
+                  "purpose": ""
+                }
+              }
+            }')
+
+          SUBMIT_STATUS=$(echo "$SUBMIT_RESP" | grep "HTTP_STATUS:" | cut -d':' -f2)
+          SUBMIT_BODY=$(echo "$SUBMIT_RESP" | sed '/HTTP_STATUS:/d')
+
+          if [ "$SUBMIT_STATUS" -ne 201 ]; then
+            echo "Submission failed. Status: $SUBMIT_STATUS"
+            echo "$SUBMIT_BODY"
+            exit 1
+          fi
+
+          echo "Version $VERSION successfully submitted for Node.aec curation review!"
